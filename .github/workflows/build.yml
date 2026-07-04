@@ -31,6 +31,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Restrict the default GITHUB_TOKEN to read-only; no deployment or write
+# access is needed for a pure build/test workflow.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build · ${{ matrix.artifact_name }}
