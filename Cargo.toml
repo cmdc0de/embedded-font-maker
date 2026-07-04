@@ -1,0 +1,16 @@
+[package]
+name = "embedded-font-maker"
+version = "0.1.0"
+edition = "2024"
+description = "A GUI tool for creating bitmap fonts for embedded devices (SSD1306 and similar)"
+license = "MIT"
+repository = "https://github.com/cmdc0de/embedded-font-maker"
+
+[dependencies]
+eframe = "0.35.0"
+rfd = "0.17.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
