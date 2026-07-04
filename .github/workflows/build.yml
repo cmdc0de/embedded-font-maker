@@ -1,0 +1,129 @@
+# Build embedded-font-maker for all supported platforms.
+#
+# Target matrix
+# ┌───────────────────────┬──────────────────────────────────┬───────────────────────┐
+# │ Platform              │ Rust target triple               │ CI runner             │
+# ├───────────────────────┼──────────────────────────────────┼───────────────────────┤
+# │ Windows x64           │ x86_64-pc-windows-msvc           │ windows-latest (x64)  │
+# │ Windows ARM64         │ aarch64-pc-windows-msvc          │ windows-latest (x64)  │
+# │ Ubuntu 26 x64         │ x86_64-unknown-linux-gnu         │ ubuntu-latest (x64)   │
+# │ Ubuntu 26 ARM64       │ aarch64-unknown-linux-gnu        │ ubuntu-24.04-arm      │
+# │ macOS ARM (Apple Si.) │ aarch64-apple-darwin             │ macos-latest (arm64)  │
+# └───────────────────────┴──────────────────────────────────┴───────────────────────┘
+#
+# Notes
+# • Windows ARM64 is cross-compiled on the x64 runner using the MSVC ARM64
+#   cross-toolchain bundled with Visual Studio – no separate runner needed.
+# • Ubuntu ARM64 uses GitHub's native arm64 runners so tests run natively.
+# • macOS runners are Apple Silicon (arm64) so tests also run natively.
+# • The Ubuntu 26.04 runner label will be updated when GitHub Actions publishes it;
+#   meanwhile ubuntu-latest targets the most-recent stable Ubuntu release.
+
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build · ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Windows ────────────────────────────────────────────────────────
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: embedded-font-maker-windows-x64
+            run_tests: true
+
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: embedded-font-maker-windows-arm64
+            # Tests cannot run on an x64 host for an arm64 binary
+            run_tests: false
+
+          # ── Ubuntu 26 (latest) ─────────────────────────────────────────────
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: embedded-font-maker-ubuntu-x64
+            run_tests: true
+
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: embedded-font-maker-ubuntu-arm64
+            run_tests: true
+
+          # ── macOS ARM (Apple Silicon) ──────────────────────────────────────
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: embedded-font-maker-macos-arm
+            run_tests: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable + target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ── Linux system libraries required by eframe / winit / rfd ────────────
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      # ── Cargo cache ─────────────────────────────────────────────────────────
+      - name: Cache Cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ── Tests ────────────────────────────────────────────────────────────────
+      - name: Run tests
+        if: matrix.run_tests
+        run: cargo test --target ${{ matrix.target }}
+
+      # ── Artifact upload ──────────────────────────────────────────────────────
+      - name: Upload binary (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/embedded-font-maker
+          if-no-files-found: error
+
+      - name: Upload binary (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/embedded-font-maker.exe
+          if-no-files-found: error
