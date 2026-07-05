@@ -115,10 +115,6 @@ pub struct FontMakerApp {
     current_path: Option<PathBuf>,
     status: String,
 
-    /// `Some(true)` while the user is painting pixels on; `Some(false)` while
-    /// painting pixels off; `None` when not drawing.
-    draw_value: Option<bool>,
-
     show_new_dialog: bool,
     new_settings: NewFontSettings,
 
@@ -136,7 +132,6 @@ impl FontMakerApp {
             current_glyph: 0,
             current_path: None,
             status: "Ready – create a new font or open an existing one.".to_string(),
-            draw_value: None,
             show_new_dialog: false,
             new_settings: settings,
             save_summary: None,
@@ -322,6 +317,16 @@ impl FontMakerApp {
                 && self.current_glyph + 1 < self.font.total_glyphs as usize
             {
                 self.current_glyph += 1;
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("↔ Center H").clicked() {
+                self.font.center_glyph_horizontally(self.current_glyph);
+            }
+            if ui.button("↕ Center V").clicked() {
+                self.font.center_glyph_vertically(self.current_glyph);
             }
         });
 
@@ -666,20 +671,21 @@ impl FontMakerApp {
         painter.rect_filled(response.rect, 0.0, Color32::from_gray(25));
 
         // ── Pointer interaction ───────────────────────────────────────────
+        // Left button paints pixels on; right button erases them.  Holding
+        // either button while dragging keeps painting/erasing.
         let ctx = ui.ctx();
         let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
-        let btn_pressed =
-            ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
-        let btn_down =
-            ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-        let btn_released =
-            ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        let paint_value = ctx.input(|i| {
+            if i.pointer.button_down(egui::PointerButton::Primary) {
+                Some(true)
+            } else if i.pointer.button_down(egui::PointerButton::Secondary) {
+                Some(false)
+            } else {
+                None
+            }
+        });
 
-        if btn_released {
-            self.draw_value = None;
-        }
-
-        if let Some(pos) = pointer_pos
+        if let (Some(pos), Some(val)) = (pointer_pos, paint_value)
             && response.rect.contains(pos)
         {
             let local = pos - grid_origin;
@@ -689,19 +695,7 @@ impl FontMakerApp {
             if gx >= 0 && gy >= 0 {
                 let (gx, gy) = (gx as usize, gy as usize);
                 if gx < w && gy < h {
-                    if btn_pressed {
-                        let current =
-                            self.font.get_pixel(self.current_glyph, gx, gy);
-                        self.draw_value = Some(!current);
-                    }
-                    if btn_down && let Some(val) = self.draw_value {
-                        self.font.set_pixel(
-                            self.current_glyph,
-                            gx,
-                            gy,
-                            val,
-                        );
-                    }
+                    self.font.set_pixel(self.current_glyph, gx, gy, val);
                 }
             }
         }
