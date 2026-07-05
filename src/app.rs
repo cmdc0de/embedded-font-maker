@@ -71,6 +71,42 @@ impl NewFontSettings {
     }
 }
 
+// ─── Save summary (shown after a successful Save / Save As) ───────────────────
+
+/// Snapshot of the font/file details captured at the moment of a successful
+/// save, so later edits don't change what the summary reports.
+struct SaveSummary {
+    path: PathBuf,
+    file_size: usize,
+    data_size: usize,
+    bytes_per_glyph: usize,
+    width: u8,
+    height: u8,
+    glyphs_per_row: u8,
+    rows: u16,
+    total_glyphs: u16,
+    first_glyph: u8,
+    column_major: bool,
+}
+
+impl SaveSummary {
+    fn from_font(font: &Font, path: PathBuf) -> Self {
+        Self {
+            path,
+            file_size: font.file_size(),
+            data_size: font.data_size(),
+            bytes_per_glyph: font.bytes_per_glyph(),
+            width: font.width,
+            height: font.height,
+            glyphs_per_row: font.glyphs_per_row,
+            rows: font.rows(),
+            total_glyphs: font.total_glyphs,
+            first_glyph: font.first_glyph,
+            column_major: font.column_major,
+        }
+    }
+}
+
 // ─── Application state ────────────────────────────────────────────────────────
 
 pub struct FontMakerApp {
@@ -85,6 +121,10 @@ pub struct FontMakerApp {
 
     show_new_dialog: bool,
     new_settings: NewFontSettings,
+
+    /// Details of the last successful save; the summary window is shown while
+    /// this is `Some`.
+    save_summary: Option<SaveSummary>,
 }
 
 impl FontMakerApp {
@@ -99,6 +139,7 @@ impl FontMakerApp {
             draw_value: None,
             show_new_dialog: false,
             new_settings: settings,
+            save_summary: None,
         }
     }
 
@@ -125,6 +166,8 @@ impl FontMakerApp {
             Ok(mut f) => match self.font.save(&mut f) {
                 Ok(()) => {
                     self.status = format!("Saved: {}", path.display());
+                    self.save_summary =
+                        Some(SaveSummary::from_font(&self.font, path.clone()));
                     self.current_path = Some(path);
                 }
                 Err(e) => self.status = format!("Error writing font: {e}"),
@@ -498,6 +541,89 @@ impl FontMakerApp {
         }
     }
 
+    fn draw_save_summary_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(ref summary) = self.save_summary else {
+            return;
+        };
+
+        let mut window_open = true;
+        let mut do_close = false;
+
+        egui::Window::new("Font Saved")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut window_open)
+            .show(ui.ctx(), |ui| {
+                ui.label(summary.path.display().to_string());
+                ui.add_space(6.0);
+                ui.separator();
+
+                egui::Grid::new("save_summary_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .min_col_width(140.0)
+                    .show(ui, |ui| {
+                        ui.label("File size:");
+                        ui.label(format!("{} bytes", summary.file_size));
+                        ui.end_row();
+
+                        ui.label("Header:");
+                        ui.label(format!("{} bytes", crate::font::HEADER_SIZE));
+                        ui.end_row();
+
+                        ui.label("Glyph data array:");
+                        ui.label(format!("{} bytes", summary.data_size));
+                        ui.end_row();
+
+                        ui.label("Bytes per glyph:");
+                        ui.label(summary.bytes_per_glyph.to_string());
+                        ui.end_row();
+
+                        ui.label("Glyph size:");
+                        ui.label(format!("{}×{} px", summary.width, summary.height));
+                        ui.end_row();
+
+                        ui.label("Total glyphs:");
+                        ui.label(summary.total_glyphs.to_string());
+                        ui.end_row();
+
+                        ui.label("Glyphs per row:");
+                        ui.label(summary.glyphs_per_row.to_string());
+                        ui.end_row();
+
+                        ui.label("Rows:");
+                        ui.label(summary.rows.to_string());
+                        ui.end_row();
+
+                        ui.label("First glyph:");
+                        ui.label(format!(
+                            "'{}' (0x{:02X})",
+                            summary.first_glyph as char, summary.first_glyph
+                        ));
+                        ui.end_row();
+
+                        ui.label("Encoding:");
+                        ui.label(if summary.column_major {
+                            "Column-major"
+                        } else {
+                            "Row-major"
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    do_close = true;
+                }
+            });
+
+        if do_close || !window_open {
+            self.save_summary = None;
+        }
+    }
+
     fn draw_glyph_editor(&mut self, ui: &mut egui::Ui) {
         let w = self.font.width as usize;
         let h = self.font.height as usize;
@@ -659,8 +785,9 @@ impl eframe::App for FontMakerApp {
                 self.draw_settings_panel(ui);
             });
 
-        // Floating dialog (must be shown before CentralPanel)
+        // Floating dialogs (must be shown before CentralPanel)
         self.draw_new_font_dialog(ui);
+        self.draw_save_summary_dialog(ui);
 
         // Central panel – glyph editor (must be last)
         egui::CentralPanel::default().show(ui, |ui| {

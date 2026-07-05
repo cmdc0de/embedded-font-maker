@@ -84,6 +84,21 @@ impl Font {
         }
     }
 
+    /// Number of bytes used to store one glyph's packed pixel data.
+    pub fn bytes_per_glyph(&self) -> usize {
+        ((self.width as usize) * (self.height as usize)).div_ceil(8)
+    }
+
+    /// Total size in bytes of the glyph pixel-data array (all glyphs, packed).
+    pub fn data_size(&self) -> usize {
+        self.bytes_per_glyph() * self.total_glyphs as usize
+    }
+
+    /// Total size in bytes of the serialised font file (header + glyph data).
+    pub fn file_size(&self) -> usize {
+        HEADER_SIZE + self.data_size()
+    }
+
     /// Number of rows needed to display all glyphs at `glyphs_per_row` columns.
     pub fn rows(&self) -> u16 {
         if self.glyphs_per_row == 0 {
@@ -346,6 +361,19 @@ mod tests {
         buf[5] = 8;
         let result = Font::load(&mut Cursor::new(&buf));
         assert!(result.is_err());
+    }
+
+    /// The size helpers must agree with the actual serialised byte count.
+    #[test]
+    fn size_helpers_match_serialised_output() {
+        let font = Font::new(5, 7, 8, b'A', 26, false);
+        assert_eq!(font.bytes_per_glyph(), 5); // ceil(5*7/8) = 5
+        assert_eq!(font.data_size(), 5 * 26);
+        assert_eq!(font.file_size(), HEADER_SIZE + 5 * 26);
+
+        let mut buf = Vec::new();
+        font.save(&mut buf).unwrap();
+        assert_eq!(buf.len(), font.file_size());
     }
 
     #[test]
