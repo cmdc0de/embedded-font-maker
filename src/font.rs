@@ -84,6 +84,21 @@ impl Font {
         }
     }
 
+    /// Number of bytes used to store one glyph's packed pixel data.
+    pub fn bytes_per_glyph(&self) -> usize {
+        ((self.width as usize) * (self.height as usize)).div_ceil(8)
+    }
+
+    /// Total size in bytes of the glyph pixel-data array (all glyphs, packed).
+    pub fn data_size(&self) -> usize {
+        self.bytes_per_glyph() * self.total_glyphs as usize
+    }
+
+    /// Total size in bytes of the serialised font file (header + glyph data).
+    pub fn file_size(&self) -> usize {
+        HEADER_SIZE + self.data_size()
+    }
+
     /// Number of rows needed to display all glyphs at `glyphs_per_row` columns.
     pub fn rows(&self) -> u16 {
         if self.glyphs_per_row == 0 {
@@ -146,6 +161,77 @@ impl Font {
         if let Some(glyph) = self.glyphs.get_mut(glyph_idx) {
             glyph.fill(false);
         }
+    }
+
+    /// Bounding box of the set pixels in a glyph as
+    /// `(min_x, min_y, max_x, max_y)`, or `None` if the glyph is empty.
+    fn glyph_bounds(&self, glyph_idx: usize) -> Option<(usize, usize, usize, usize)> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        for y in 0..h {
+            for x in 0..w {
+                if self.get_pixel(glyph_idx, x, y) {
+                    bounds = Some(match bounds {
+                        None => (x, y, x, y),
+                        Some((min_x, min_y, max_x, max_y)) => {
+                            (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                        }
+                    });
+                }
+            }
+        }
+        bounds
+    }
+
+    /// Shift all set pixels of a glyph by `(dx, dy)`.  Pixels shifted outside
+    /// the glyph are discarded.
+    fn shift_glyph(&mut self, glyph_idx: usize, dx: isize, dy: isize) {
+        if (dx == 0 && dy == 0) || glyph_idx >= self.glyphs.len() {
+            return;
+        }
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let old = self.glyphs[glyph_idx].clone();
+        let mut shifted = vec![false; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                if old[self.pixel_index(w, h, x, y)] {
+                    let nx = x as isize + dx;
+                    let ny = y as isize + dy;
+                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                        shifted[self.pixel_index(w, h, nx as usize, ny as usize)] = true;
+                    }
+                }
+            }
+        }
+        self.glyphs[glyph_idx] = shifted;
+    }
+
+    /// Horizontally centre the set pixels of a glyph.  Empty glyphs are
+    /// left unchanged.  When the free space is odd the extra column goes to
+    /// the right.
+    pub fn center_glyph_horizontally(&mut self, glyph_idx: usize) {
+        let Some((min_x, _, max_x, _)) = self.glyph_bounds(glyph_idx) else {
+            return;
+        };
+        let w = self.width as usize;
+        let content_w = max_x - min_x + 1;
+        let target_min = (w - content_w) / 2;
+        self.shift_glyph(glyph_idx, target_min as isize - min_x as isize, 0);
+    }
+
+    /// Vertically centre the set pixels of a glyph.  Empty glyphs are left
+    /// unchanged.  When the free space is odd the extra row goes to the
+    /// bottom.
+    pub fn center_glyph_vertically(&mut self, glyph_idx: usize) {
+        let Some((_, min_y, _, max_y)) = self.glyph_bounds(glyph_idx) else {
+            return;
+        };
+        let h = self.height as usize;
+        let content_h = max_y - min_y + 1;
+        let target_min = (h - content_h) / 2;
+        self.shift_glyph(glyph_idx, 0, target_min as isize - min_y as isize);
     }
 
     fn pixel_index(&self, w: usize, h: usize, x: usize, y: usize) -> usize {
@@ -348,6 +434,19 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The size helpers must agree with the actual serialised byte count.
+    #[test]
+    fn size_helpers_match_serialised_output() {
+        let font = Font::new(5, 7, 8, b'A', 26, false);
+        assert_eq!(font.bytes_per_glyph(), 5); // ceil(5*7/8) = 5
+        assert_eq!(font.data_size(), 5 * 26);
+        assert_eq!(font.file_size(), HEADER_SIZE + 5 * 26);
+
+        let mut buf = Vec::new();
+        font.save(&mut buf).unwrap();
+        assert_eq!(buf.len(), font.file_size());
+    }
+
     #[test]
     fn rows_calculation() {
         let font = Font::new(8, 8, 16, b'a', 26, false);
@@ -360,6 +459,66 @@ mod tests {
         assert_eq!(font.glyph_char(0), Some('A'));
         assert_eq!(font.glyph_char(25), Some('Z'));
         assert_eq!(font.glyph_char(26), None); // out of range
+    }
+
+    /// A 2-wide block at the left edge of an 8-wide glyph centres to x=3..4.
+    #[test]
+    fn center_horizontally() {
+        let mut font = Font::new(8, 8, 16, b'a', 1, false);
+        font.set_pixel(0, 0, 2, true);
+        font.set_pixel(0, 1, 2, true);
+
+        font.center_glyph_horizontally(0);
+
+        assert!(!font.get_pixel(0, 0, 2));
+        assert!(!font.get_pixel(0, 1, 2));
+        assert!(font.get_pixel(0, 3, 2)); // (8 - 2) / 2 = 3
+        assert!(font.get_pixel(0, 4, 2));
+        // Row must be unchanged
+        assert!(!font.get_pixel(0, 3, 1));
+    }
+
+    /// A single pixel at the bottom of an 8-tall glyph centres to y=3.
+    #[test]
+    fn center_vertically() {
+        let mut font = Font::new(8, 8, 16, b'a', 1, false);
+        font.set_pixel(0, 5, 7, true);
+
+        font.center_glyph_vertically(0);
+
+        assert!(!font.get_pixel(0, 5, 7));
+        assert!(font.get_pixel(0, 5, 3)); // (8 - 1) / 2 = 3
+        // Column must be unchanged
+        assert!(!font.get_pixel(0, 4, 3));
+    }
+
+    /// Centring an empty glyph or an already-centred glyph is a no-op.
+    #[test]
+    fn center_noop_cases() {
+        let mut font = Font::new(8, 8, 16, b'a', 1, false);
+        font.center_glyph_horizontally(0);
+        font.center_glyph_vertically(0);
+        assert!(font.glyphs[0].iter().all(|&p| !p));
+
+        font.set_pixel(0, 3, 3, true);
+        font.set_pixel(0, 4, 4, true);
+        let before = font.glyphs[0].clone();
+        font.center_glyph_horizontally(0);
+        font.center_glyph_vertically(0);
+        assert_eq!(font.glyphs[0], before);
+    }
+
+    /// Centring must respect column-major pixel indexing.
+    #[test]
+    fn center_column_major() {
+        let mut font = Font::new(8, 8, 16, b'a', 1, true);
+        font.set_pixel(0, 7, 0, true);
+
+        font.center_glyph_horizontally(0);
+        font.center_glyph_vertically(0);
+
+        assert!(font.get_pixel(0, 3, 3));
+        assert!(!font.get_pixel(0, 7, 0));
     }
 
     #[test]
