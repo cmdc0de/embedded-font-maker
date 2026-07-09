@@ -12,23 +12,32 @@
 //!      7     1  First glyph ASCII code  (e.g. 0x61 = 'a')
 //!      8     2  Total number of glyphs  (little-endian u16)
 //!     10     1  Flags: bit 0 → 0 = row-major, 1 = column-major
-//!     11     1  Format version (current: 0)
-//!     12+    N  Glyph pixel data, packed bits, ceil(w*h/8) bytes per glyph
+//!     11     1  Format version (current: 1)
+//!     12+    N  Glyph pixel data (layout depends on the version, see below)
 //! ```
 //!
-//! The version byte lets the format evolve while keeping the ability to load
-//! older files.  Version 0 is the original layout described above; because
-//! earlier files wrote a zero in this (formerly reserved) byte, they load
-//! transparently as version 0.
-//!
-//! Glyph pixel data is stored in the order determined by the encoding flag:
-//! - **Row-major**: pixels are numbered left-to-right, top-to-bottom.
+//! Within every glyph the pixels are numbered according to the encoding flag:
+//! - **Row-major**: left-to-right, top-to-bottom.
 //!   Bit `i` = pixel at `(i % width, i / width)`.
-//! - **Column-major**: pixels are numbered top-to-bottom, left-to-right.
+//! - **Column-major**: top-to-bottom, left-to-right.
 //!   Bit `i` = pixel at `(i / height, i % height)`.
 //!
-//! Within each byte the least-significant bit holds the first pixel of that
-//! byte (i.e. LSB-first packing).
+//! Bits are packed least-significant-bit first: the first pixel of a byte is
+//! stored in that byte's LSB.
+//!
+//! # Glyph data layout by version
+//!
+//! - **Version 0** (legacy): each glyph is packed independently and padded to a
+//!   whole number of bytes — `ceil(width * height / 8)` bytes per glyph.  The
+//!   spare bits at the end of every glyph are wasted.
+//! - **Version 1** (current): every glyph's bits are concatenated into a single
+//!   continuous stream, so padding happens only once, at the very end of the
+//!   file — `ceil(total_glyphs * width * height / 8)` bytes total.  This is
+//!   smaller, which matters when embedding fonts on constrained devices.
+//!
+//! Version-0 files still load (the reader unpacks them with the legacy layout);
+//! [`Font::save`] always writes the current version, so opening an old file and
+//! saving it upgrades it to version 1.
 
 use std::io::{self, Read, Write};
 
@@ -40,7 +49,7 @@ pub const HEADER_SIZE: usize = 12;
 
 /// Font file format version written by [`Font::save`].  Bump this whenever the
 /// on-disk layout changes so [`Font::load`] can branch on older versions.
-pub const FORMAT_VERSION: u8 = 0;
+pub const FORMAT_VERSION: u8 = 1;
 
 /// Bit flag: column-major encoding.
 pub const FLAG_COLUMN_MAJOR: u8 = 0b0000_0001;
@@ -60,6 +69,10 @@ pub struct Font {
     pub total_glyphs: u16,
     /// When `true` pixels are stored column-major; row-major otherwise.
     pub column_major: bool,
+    /// Format version this font was loaded from (or [`FORMAT_VERSION`] for a
+    /// font created in memory).  Informational only — [`Font::save`] always
+    /// writes [`FORMAT_VERSION`].
+    pub version: u8,
     /// Pixel data for each glyph.  `glyphs[i]` has `width * height` entries.
     pub glyphs: Vec<Vec<bool>>,
 }
@@ -89,18 +102,31 @@ impl Font {
             first_glyph,
             total_glyphs,
             column_major,
+            version: FORMAT_VERSION,
             glyphs,
         }
     }
 
-    /// Number of bytes used to store one glyph's packed pixel data.
-    pub fn bytes_per_glyph(&self) -> usize {
-        ((self.width as usize) * (self.height as usize)).div_ceil(8)
+    /// Number of pixels (bits) in a single glyph.
+    pub fn pixels_per_glyph(&self) -> usize {
+        (self.width as usize) * (self.height as usize)
     }
 
-    /// Total size in bytes of the glyph pixel-data array (all glyphs, packed).
+    /// Total number of pixel cells across every glyph
+    /// (`pixels_per_glyph * total_glyphs`).
+    pub fn total_pixels(&self) -> usize {
+        self.pixels_per_glyph() * self.total_glyphs as usize
+    }
+
+    /// Number of set (filled) pixel cells across every glyph.
+    pub fn filled_pixels(&self) -> usize {
+        self.glyphs.iter().flatten().filter(|&&p| p).count()
+    }
+
+    /// Total size in bytes of the glyph pixel-data array as written by
+    /// [`Font::save`] (version 1: all glyph bits packed contiguously).
     pub fn data_size(&self) -> usize {
-        self.bytes_per_glyph() * self.total_glyphs as usize
+        (self.pixels_per_glyph() * self.total_glyphs as usize).div_ceil(8)
     }
 
     /// Total size in bytes of the serialised font file (header + glyph data).
@@ -265,19 +291,21 @@ impl Font {
         let flags: u8 = if self.column_major { FLAG_COLUMN_MAJOR } else { 0 };
         writer.write_all(&[flags, FORMAT_VERSION])?; // flags + version byte
 
-        // Glyph pixel data (packed bits, LSB first)
-        let pixels_per_glyph = (self.width as usize) * (self.height as usize);
-        let bytes_per_glyph = pixels_per_glyph.div_ceil(8);
-
+        // Glyph pixel data (version 1): every glyph's bits are concatenated
+        // into one continuous LSB-first stream, so only the final byte can be
+        // partially wasted.
+        let pixels_per_glyph = self.pixels_per_glyph();
+        let mut bytes = vec![0u8; self.data_size()];
+        let mut bit = 0usize;
         for glyph in &self.glyphs {
-            let mut bytes = vec![0u8; bytes_per_glyph];
-            for (i, &pixel) in glyph.iter().enumerate().take(pixels_per_glyph) {
-                if pixel {
-                    bytes[i / 8] |= 1 << (i % 8);
+            for i in 0..pixels_per_glyph {
+                if glyph.get(i).copied().unwrap_or(false) {
+                    bytes[bit / 8] |= 1 << (bit % 8);
                 }
+                bit += 1;
             }
-            writer.write_all(&bytes)?;
         }
+        writer.write_all(&bytes)?;
         Ok(())
     }
 
@@ -322,18 +350,10 @@ impl Font {
         }
 
         let pixels_per_glyph = (width as usize) * (height as usize);
-        let bytes_per_glyph = pixels_per_glyph.div_ceil(8);
-
-        let mut glyphs = Vec::with_capacity(total_glyphs as usize);
-        for _ in 0..total_glyphs {
-            let mut raw = vec![0u8; bytes_per_glyph];
-            reader.read_exact(&mut raw)?;
-            let mut pixels = vec![false; pixels_per_glyph];
-            for i in 0..pixels_per_glyph {
-                pixels[i] = (raw[i / 8] & (1 << (i % 8))) != 0;
-            }
-            glyphs.push(pixels);
-        }
+        let glyphs = match version {
+            0 => Self::read_glyphs_v0(reader, pixels_per_glyph, total_glyphs)?,
+            _ => Self::read_glyphs_v1(reader, pixels_per_glyph, total_glyphs)?,
+        };
 
         Ok(Self {
             width,
@@ -342,8 +362,51 @@ impl Font {
             first_glyph,
             total_glyphs,
             column_major,
+            version,
             glyphs,
         })
+    }
+
+    /// Read version-0 glyph data: each glyph padded to a whole number of bytes.
+    fn read_glyphs_v0<R: Read>(
+        reader: &mut R,
+        pixels_per_glyph: usize,
+        total_glyphs: u16,
+    ) -> io::Result<Vec<Vec<bool>>> {
+        let bytes_per_glyph = pixels_per_glyph.div_ceil(8);
+        let mut glyphs = Vec::with_capacity(total_glyphs as usize);
+        for _ in 0..total_glyphs {
+            let mut raw = vec![0u8; bytes_per_glyph];
+            reader.read_exact(&mut raw)?;
+            let mut pixels = vec![false; pixels_per_glyph];
+            for (i, p) in pixels.iter_mut().enumerate() {
+                *p = (raw[i / 8] & (1 << (i % 8))) != 0;
+            }
+            glyphs.push(pixels);
+        }
+        Ok(glyphs)
+    }
+
+    /// Read version-1 glyph data: all glyph bits packed contiguously.
+    fn read_glyphs_v1<R: Read>(
+        reader: &mut R,
+        pixels_per_glyph: usize,
+        total_glyphs: u16,
+    ) -> io::Result<Vec<Vec<bool>>> {
+        let total_bits = pixels_per_glyph * total_glyphs as usize;
+        let mut raw = vec![0u8; total_bits.div_ceil(8)];
+        reader.read_exact(&mut raw)?;
+        let mut glyphs = Vec::with_capacity(total_glyphs as usize);
+        let mut bit = 0usize;
+        for _ in 0..total_glyphs {
+            let mut pixels = vec![false; pixels_per_glyph];
+            for p in pixels.iter_mut() {
+                *p = (raw[bit / 8] & (1 << (bit % 8))) != 0;
+                bit += 1;
+            }
+            glyphs.push(pixels);
+        }
+        Ok(glyphs)
     }
 }
 
@@ -465,6 +528,71 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Serialise `font` using the legacy version-0 layout (each glyph padded to
+    /// a whole number of bytes) so we can test backward-compatible loading.
+    fn encode_v0(font: &Font) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&[
+            font.width,
+            font.height,
+            font.glyphs_per_row,
+            font.first_glyph,
+        ]);
+        buf.extend_from_slice(&font.total_glyphs.to_le_bytes());
+        let flags = if font.column_major { FLAG_COLUMN_MAJOR } else { 0 };
+        buf.extend_from_slice(&[flags, 0]); // version byte = 0
+        let pixels = font.pixels_per_glyph();
+        let bytes_per_glyph = pixels.div_ceil(8);
+        for glyph in &font.glyphs {
+            let mut bytes = vec![0u8; bytes_per_glyph];
+            for (i, &p) in glyph.iter().enumerate().take(pixels) {
+                if p {
+                    bytes[i / 8] |= 1 << (i % 8);
+                }
+            }
+            buf.extend_from_slice(&bytes);
+        }
+        buf
+    }
+
+    /// Version-0 files must still load, exposing their version, and re-saving
+    /// them upgrades to the smaller version-1 layout without losing pixels.
+    #[test]
+    fn loads_version_0_and_upgrades_on_save() {
+        let mut original = Font::new(5, 7, 8, b'A', 3, false);
+        original.set_pixel(0, 0, 0, true);
+        original.set_pixel(1, 4, 6, true);
+        original.set_pixel(2, 2, 3, true);
+
+        let v0 = encode_v0(&original);
+        assert_eq!(v0[11], 0);
+
+        let loaded = Font::load(&mut Cursor::new(&v0)).unwrap();
+        assert_eq!(loaded.version, 0);
+        assert_eq!(loaded.glyphs, original.glyphs);
+
+        // Re-saving writes the current version and a smaller payload.
+        let mut v1 = Vec::new();
+        loaded.save(&mut v1).unwrap();
+        assert_eq!(v1[11], FORMAT_VERSION);
+        assert!(v1.len() < v0.len());
+
+        let reloaded = Font::load(&mut Cursor::new(&v1)).unwrap();
+        assert_eq!(reloaded.version, FORMAT_VERSION);
+        assert_eq!(reloaded.glyphs, original.glyphs);
+    }
+
+    /// A freshly saved font reports the current version when reloaded.
+    #[test]
+    fn round_trip_reports_current_version() {
+        let font = Font::new(7, 10, 16, b' ', 95, false);
+        let mut buf = Vec::new();
+        font.save(&mut buf).unwrap();
+        let loaded = Font::load(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(loaded.version, FORMAT_VERSION);
+    }
+
     /// A font with zero-dimension glyphs must be rejected.
     #[test]
     fn zero_dimension_rejected() {
@@ -480,9 +608,10 @@ mod tests {
     #[test]
     fn size_helpers_match_serialised_output() {
         let font = Font::new(5, 7, 8, b'A', 26, false);
-        assert_eq!(font.bytes_per_glyph(), 5); // ceil(5*7/8) = 5
-        assert_eq!(font.data_size(), 5 * 26);
-        assert_eq!(font.file_size(), HEADER_SIZE + 5 * 26);
+        assert_eq!(font.pixels_per_glyph(), 35); // 5 * 7
+        // Version 1 packs all glyph bits contiguously: ceil(35 * 26 / 8) = 114.
+        assert_eq!(font.data_size(), 114);
+        assert_eq!(font.file_size(), HEADER_SIZE + 114);
 
         let mut buf = Vec::new();
         font.save(&mut buf).unwrap();
