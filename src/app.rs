@@ -21,11 +21,11 @@ struct NewFontSettings {
 impl Default for NewFontSettings {
     fn default() -> Self {
         Self {
-            width: 8,
-            height: 8,
+            width: 7,
+            height: 10,
             glyphs_per_row: 16,
-            first_glyph_str: "a".to_string(),
-            total_glyphs: 26,
+            first_glyph_str: " ".to_string(),
+            total_glyphs: 95,
             column_major: false,
         }
     }
@@ -121,6 +121,9 @@ pub struct FontMakerApp {
     /// Details of the last successful save; the summary window is shown while
     /// this is `Some`.
     save_summary: Option<SaveSummary>,
+
+    /// When `true`, the ASCII reference table is shown on the right side.
+    show_ascii_table: bool,
 }
 
 impl FontMakerApp {
@@ -135,6 +138,7 @@ impl FontMakerApp {
             show_new_dialog: false,
             new_settings: settings,
             save_summary: None,
+            show_ascii_table: false,
         }
     }
 
@@ -192,6 +196,53 @@ impl FontMakerApp {
             .pick_file()
     }
 
+    // ── File actions (shared by the menu and keyboard shortcuts) ──────────────
+
+    /// Standard keyboard shortcuts. `COMMAND` maps to ⌘ on macOS and Ctrl
+    /// elsewhere.
+    const OPEN_SHORTCUT: egui::KeyboardShortcut =
+        egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+    const SAVE_SHORTCUT: egui::KeyboardShortcut =
+        egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+    const SAVE_AS_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+        egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+        egui::Key::S,
+    );
+
+    fn open_file(&mut self) {
+        if let Some(path) = Self::pick_open_path() {
+            self.load_font(path);
+        }
+    }
+
+    /// Save to the current path if there is one, otherwise prompt for a path.
+    fn save_file(&mut self) {
+        let path = self.current_path.clone().or_else(Self::pick_save_path);
+        if let Some(p) = path {
+            self.save_font_to(p);
+        }
+    }
+
+    fn save_file_as(&mut self) {
+        if let Some(p) = Self::pick_save_path() {
+            self.save_font_to(p);
+        }
+    }
+
+    /// Consume any file-related keyboard shortcuts that were pressed this frame.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_shortcut(&Self::OPEN_SHORTCUT)) {
+            self.open_file();
+        }
+        // Check Save As before Save so ⌘⇧S isn't swallowed by the ⌘S binding.
+        if ctx.input_mut(|i| i.consume_shortcut(&Self::SAVE_AS_SHORTCUT)) {
+            self.save_file_as();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&Self::SAVE_SHORTCUT)) {
+            self.save_file();
+        }
+    }
+
     // ── UI helpers ────────────────────────────────────────────────────────────
 
     fn draw_menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -202,10 +253,10 @@ impl FontMakerApp {
                     self.show_new_dialog = true;
                     ui.close();
                 }
-                if ui.button("Open…").clicked() {
-                    if let Some(path) = Self::pick_open_path() {
-                        self.load_font(path);
-                    }
+                let open_btn = egui::Button::new("Open…")
+                    .shortcut_text(ui.ctx().format_shortcut(&Self::OPEN_SHORTCUT));
+                if ui.add(open_btn).clicked() {
+                    self.open_file();
                     ui.close();
                 }
                 ui.separator();
@@ -214,22 +265,29 @@ impl FontMakerApp {
                 } else {
                     "Save…"
                 };
-                if ui.button(save_label).clicked() {
-                    let path = self.current_path.clone().or_else(Self::pick_save_path);
-                    if let Some(p) = path {
-                        self.save_font_to(p);
-                    }
+                let save_btn = egui::Button::new(save_label)
+                    .shortcut_text(ui.ctx().format_shortcut(&Self::SAVE_SHORTCUT));
+                if ui.add(save_btn).clicked() {
+                    self.save_file();
                     ui.close();
                 }
-                if ui.button("Save As…").clicked() {
-                    if let Some(p) = Self::pick_save_path() {
-                        self.save_font_to(p);
-                    }
+                let save_as_btn = egui::Button::new("Save As…")
+                    .shortcut_text(ui.ctx().format_shortcut(&Self::SAVE_AS_SHORTCUT));
+                if ui.add(save_as_btn).clicked() {
+                    self.save_file_as();
                     ui.close();
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui
+                    .checkbox(&mut self.show_ascii_table, "ASCII Table")
+                    .clicked()
+                {
+                    ui.close();
                 }
             });
         });
@@ -629,6 +687,69 @@ impl FontMakerApp {
         }
     }
 
+    fn draw_ascii_table(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.heading("ASCII Table");
+        ui.label(
+            egui::RichText::new("Rows in the font are highlighted; click to edit.")
+                .small()
+                .weak(),
+        );
+        ui.separator();
+
+        let first = self.font.first_glyph as usize;
+        let last = first + self.font.total_glyphs as usize; // exclusive
+
+        egui::ScrollArea::vertical()
+            .id_salt("ascii_table_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for code in 0u8..=127 {
+                    let in_font =
+                        (code as usize) >= first && (code as usize) < last;
+                    let glyph_idx = (code as usize).wrapping_sub(first);
+                    let is_current = in_font && glyph_idx == self.current_glyph;
+
+                    let text = format!(
+                        "{:>3}  0x{:02X}  {}",
+                        code,
+                        code,
+                        Self::ascii_display(code),
+                    );
+
+                    let rich = if in_font {
+                        egui::RichText::new(text).monospace()
+                    } else {
+                        egui::RichText::new(text).monospace().weak()
+                    };
+
+                    let mut clicked = false;
+                    ui.add_enabled_ui(in_font, |ui| {
+                        clicked = ui.selectable_label(is_current, rich).clicked();
+                    });
+                    if clicked {
+                        self.current_glyph = glyph_idx;
+                    }
+                }
+            });
+    }
+
+    /// Human-readable label for an ASCII code: control-character abbreviation,
+    /// the printable glyph itself, or a placeholder for DEL.
+    fn ascii_display(code: u8) -> String {
+        const CTRL: [&str; 32] = [
+            "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL", "BS", "TAB",
+            "LF", "VT", "FF", "CR", "SO", "SI", "DLE", "DC1", "DC2", "DC3", "DC4",
+            "NAK", "SYN", "ETB", "CAN", "EM", "SUB", "ESC", "FS", "GS", "RS", "US",
+        ];
+        match code {
+            0..=31 => CTRL[code as usize].to_string(),
+            32 => "SP".to_string(),
+            127 => "DEL".to_string(),
+            _ => (code as char).to_string(),
+        }
+    }
+
     fn draw_glyph_editor(&mut self, ui: &mut egui::Ui) {
         let w = self.font.width as usize;
         let h = self.font.height as usize;
@@ -751,6 +872,9 @@ impl FontMakerApp {
 impl eframe::App for FontMakerApp {
     /// Called each time the UI needs repainting.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Keyboard shortcuts (Open / Save / Save As).
+        self.handle_shortcuts(ui.ctx());
+
         // Panels must be added in outside-in order: fixed borders first, then
         // the central area last.
         egui::Panel::top("menu_bar").show(ui, |ui| {
@@ -778,6 +902,17 @@ impl eframe::App for FontMakerApp {
             .show(ui, |ui| {
                 self.draw_settings_panel(ui);
             });
+
+        // ASCII table on the right (optional)
+        if self.show_ascii_table {
+            egui::Panel::right("ascii_table_panel")
+                .resizable(true)
+                .min_size(160.0)
+                .default_size(190.0)
+                .show(ui, |ui| {
+                    self.draw_ascii_table(ui);
+                });
+        }
 
         // Floating dialogs (must be shown before CentralPanel)
         self.draw_new_font_dialog(ui);
