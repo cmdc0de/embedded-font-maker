@@ -710,6 +710,69 @@ impl FontMakerApp {
         }
     }
 
+    fn draw_ascii_table(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.heading("ASCII Table");
+        ui.label(
+            egui::RichText::new("Rows in the font are highlighted; click to edit.")
+                .small()
+                .weak(),
+        );
+        ui.separator();
+
+        let first = self.font.first_glyph as usize;
+        let last = first + self.font.total_glyphs as usize; // exclusive
+
+        egui::ScrollArea::vertical()
+            .id_salt("ascii_table_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for code in 0u8..=127 {
+                    let in_font =
+                        (code as usize) >= first && (code as usize) < last;
+                    let glyph_idx = (code as usize).wrapping_sub(first);
+                    let is_current = in_font && glyph_idx == self.current_glyph;
+
+                    let text = format!(
+                        "{:>3}  0x{:02X}  {}",
+                        code,
+                        code,
+                        Self::ascii_display(code),
+                    );
+
+                    let rich = if in_font {
+                        egui::RichText::new(text).monospace()
+                    } else {
+                        egui::RichText::new(text).monospace().weak()
+                    };
+
+                    let mut clicked = false;
+                    ui.add_enabled_ui(in_font, |ui| {
+                        clicked = ui.selectable_label(is_current, rich).clicked();
+                    });
+                    if clicked {
+                        self.current_glyph = glyph_idx;
+                    }
+                }
+            });
+    }
+
+    /// Human-readable label for an ASCII code: control-character abbreviation,
+    /// the printable glyph itself, or a placeholder for DEL.
+    fn ascii_display(code: u8) -> String {
+        const CTRL: [&str; 32] = [
+            "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL", "BS", "TAB",
+            "LF", "VT", "FF", "CR", "SO", "SI", "DLE", "DC1", "DC2", "DC3", "DC4",
+            "NAK", "SYN", "ETB", "CAN", "EM", "SUB", "ESC", "FS", "GS", "RS", "US",
+        ];
+        match code {
+            0..=31 => CTRL[code as usize].to_string(),
+            32 => "SP".to_string(),
+            127 => "DEL".to_string(),
+            _ => (code as char).to_string(),
+        }
+    }
+
     fn draw_glyph_editor(&mut self, ui: &mut egui::Ui) {
         let w = self.font.width as usize;
         let h = self.font.height as usize;
