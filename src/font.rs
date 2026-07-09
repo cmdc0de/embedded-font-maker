@@ -12,9 +12,14 @@
 //!      7     1  First glyph ASCII code  (e.g. 0x61 = 'a')
 //!      8     2  Total number of glyphs  (little-endian u16)
 //!     10     1  Flags: bit 0 → 0 = row-major, 1 = column-major
-//!     11     1  Reserved (zero)
+//!     11     1  Format version (current: 0)
 //!     12+    N  Glyph pixel data, packed bits, ceil(w*h/8) bytes per glyph
 //! ```
+//!
+//! The version byte lets the format evolve while keeping the ability to load
+//! older files.  Version 0 is the original layout described above; because
+//! earlier files wrote a zero in this (formerly reserved) byte, they load
+//! transparently as version 0.
 //!
 //! Glyph pixel data is stored in the order determined by the encoding flag:
 //! - **Row-major**: pixels are numbered left-to-right, top-to-bottom.
@@ -32,6 +37,10 @@ pub const MAGIC: [u8; 4] = [b'F', b'N', b'T', 0x00];
 
 /// Fixed size (in bytes) of the file header.
 pub const HEADER_SIZE: usize = 12;
+
+/// Font file format version written by [`Font::save`].  Bump this whenever the
+/// on-disk layout changes so [`Font::load`] can branch on older versions.
+pub const FORMAT_VERSION: u8 = 0;
 
 /// Bit flag: column-major encoding.
 pub const FLAG_COLUMN_MAJOR: u8 = 0b0000_0001;
@@ -57,7 +66,7 @@ pub struct Font {
 
 impl Default for Font {
     fn default() -> Self {
-        Self::new(8, 8, 16, b'a', 26, false)
+        Self::new(7, 10, 16, b' ', 95, false)
     }
 }
 
@@ -254,7 +263,7 @@ impl Font {
         ])?;
         writer.write_all(&self.total_glyphs.to_le_bytes())?;
         let flags: u8 = if self.column_major { FLAG_COLUMN_MAJOR } else { 0 };
-        writer.write_all(&[flags, 0])?; // flags + reserved byte
+        writer.write_all(&[flags, FORMAT_VERSION])?; // flags + version byte
 
         // Glyph pixel data (packed bits, LSB first)
         let pixels_per_glyph = (self.width as usize) * (self.height as usize);
@@ -291,6 +300,19 @@ impl Font {
         let total_glyphs = u16::from_le_bytes([header[8], header[9]]);
         let flags = header[10];
         let column_major = (flags & FLAG_COLUMN_MAJOR) != 0;
+        let version = header[11];
+
+        // Refuse files written by a newer format than we understand.  As new
+        // versions are added, branch the parsing below on `version`.
+        if version > FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported font format version {version} \
+                     (this build supports up to {FORMAT_VERSION})"
+                ),
+            ));
+        }
 
         if width == 0 || height == 0 {
             return Err(io::Error::new(
@@ -419,6 +441,26 @@ mod tests {
     fn bad_magic_is_rejected() {
         let mut buf = vec![0u8; HEADER_SIZE + 8];
         buf[0] = b'X'; // corrupt magic
+        let result = Font::load(&mut Cursor::new(&buf));
+        assert!(result.is_err());
+    }
+
+    /// `save` must write the current format version into the header.
+    #[test]
+    fn save_writes_format_version() {
+        let font = Font::new(4, 4, 4, b'a', 1, false);
+        let mut buf = Vec::new();
+        font.save(&mut buf).unwrap();
+        assert_eq!(buf[11], FORMAT_VERSION);
+    }
+
+    /// A file claiming a newer format version than we support must be rejected.
+    #[test]
+    fn newer_version_is_rejected() {
+        let font = Font::new(4, 4, 4, b'a', 1, false);
+        let mut buf = Vec::new();
+        font.save(&mut buf).unwrap();
+        buf[11] = FORMAT_VERSION + 1; // pretend it's from a future build
         let result = Font::load(&mut Cursor::new(&buf));
         assert!(result.is_err());
     }
